@@ -1,0 +1,562 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <memory>
+#include <random>
+#include <cmath>
+#include <iomanip>
+
+#include <cuda_runtime.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/generate.h>
+#include <thrust/random.h>
+
+#include "winograd.cuh"
+
+#define LOOP_NUM 3
+#define GREEN "\033[32m"
+#define RED "\033[31m"
+#define RESET "\033[0m"
+
+//
+#include <chrono>
+
+struct DeviceGuard {
+    int prev{-1};
+    DeviceGuard(int d) {
+        cudaGetDevice(&prev);
+        cudaSetDevice(d);
+    }
+    ~DeviceGuard() {
+        if (prev >= 0) cudaSetDevice(prev);
+    }
+};
+
+static inline void checkCuda(cudaError_t e, const char* msg) {
+    if (e != cudaSuccess) {
+        std::cerr << "CUDA Error: " << msg << " : " << cudaGetErrorString(e) << std::endl;
+        std::exit(1);
+    }
+}
+//
+
+
+class Config {
+public:
+    std::vector<int> C, H, W, K, Batch;
+    int layer_num;
+
+    Config(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open config file: " + filename);
+        }
+        
+        file >> layer_num;
+        C.resize(layer_num);
+        H.resize(layer_num);
+        W.resize(layer_num);
+        K.resize(layer_num);
+        Batch.resize(layer_num);
+        
+        for (int i = 0; i < layer_num; i++) {
+            file >> C[i] >> H[i] >> W[i] >> K[i] >> Batch[i];
+        }
+    }
+};
+
+class LayerResult {
+public:
+    double baseline_time = 0.0;
+    double winograd_time = 0.0;
+    double baseline_gflops = 0.0;
+    double winograd_gflops = 0.0;
+    double speedup = 0.0;
+    bool passed = false;
+};
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::cout << "Usage: " << argv[0] << " <config_file>" << std::endl;
+        return 1;
+    }
+
+    auto cfg = std::make_unique<Config>(argv[1]);
+    std::vector<LayerResult> results(cfg->layer_num);
+    
+    cudaEvent_t start_event, stop_event;
+    cudaEventCreate(&start_event);
+    cudaEventCreate(&stop_event);
+    float milliseconds = 0;
+
+    thrust::host_vector<thrust::host_vector<float>> h_images(cfg->layer_num);
+    thrust::host_vector<thrust::host_vector<float>> h_filters(cfg->layer_num);
+
+    std::random_device rd;
+    thrust::default_random_engine rng(rd());
+    thrust::uniform_real_distribution<float> dist(0.0f, 10.0f);
+
+    for (int l = 0; l < cfg->layer_num; l++) {
+        int H = cfg->H[l], W = cfg->W[l], C = cfg->C[l], K = cfg->K[l], N = cfg->Batch[l];
+        long sizeI = H * W, sizeF = 9;
+        h_images[l].resize(N * C * sizeI);
+        h_filters[l].resize(K * C * sizeF);
+        thrust::generate(h_images[l].begin(), h_images[l].end(), [&] { return dist(rng); });
+        thrust::generate(h_filters[l].begin(), h_filters[l].end(), [&] { return dist(rng); });
+    }
+
+    thrust::host_vector<thrust::host_vector<float>> h_baseline_outputs(cfg->layer_num);
+    thrust::host_vector<thrust::host_vector<float>> h_custom_outputs(cfg->layer_num);
+
+    /*std::cout << "=== Running Naive Convolution ===" << std::endl;
+    double baseline_total_time = 0;
+    long total_flops = 0;
+
+    for (int l = 0; l < cfg->layer_num; l++) {
+        int H = cfg->H[l], W = cfg->W[l], C = cfg->C[l], K = cfg->K[l], N = cfg->Batch[l];
+        long sizeI = H * W, sizeF = 9, sizeO = (H-2) * (W-2);
+        long P = N * (H-2)/2 * (W-2)/2;
+
+        thrust::host_vector<float>& h_image = h_images[l];
+        thrust::host_vector<float>& h_filter = h_filters[l];
+
+        thrust::device_vector<float> d_image = h_image;
+        thrust::device_vector<float> d_filter = h_filter;
+        thrust::device_vector<float> d_out(N * K * sizeO);
+        thrust::device_vector<float> d_U(16 * K * C);
+        thrust::device_vector<float> d_V(16 * C * P);
+        thrust::device_vector<float> d_M(16 * K * P);
+
+        // Warmup
+        naive_conv(d_image, d_filter, d_out, d_U, d_V, d_M, H, W, C, K, N);
+
+        cudaEventRecord(start_event);
+        for (int i = 0; i < LOOP_NUM; i++) {
+            naive_conv(d_image, d_filter, d_out, d_U, d_V, d_M, H, W, C, K, N);
+        }
+        cudaEventRecord(stop_event);
+        cudaEventSynchronize(stop_event);
+        cudaEventElapsedTime(&milliseconds, start_event, stop_event);
+        results[l].baseline_time = static_cast<double>(milliseconds / 1000.0f) / LOOP_NUM;
+
+        h_baseline_outputs[l] = d_out;
+
+        long flops = static_cast<long>(N) * K * C * (H-2) * (W-2) * 18;
+        results[l].baseline_gflops = flops * 1e-9 / results[l].baseline_time;
+        
+        std::cout << "Layer " << std::setw(2) << l << ": " << std::fixed << std::setprecision(2)
+                  << results[l].baseline_time * 1000 << " ms (" << results[l].baseline_gflops << " GFLOPS)" << std::endl;
+        
+        baseline_total_time += results[l].baseline_time;
+        total_flops += flops;
+    }
+    std::cout << "Baseline Total: " << std::fixed << std::setprecision(2) << baseline_total_time * 1000 
+              << " ms (" << total_flops * 1e-9 / baseline_total_time << " GFLOPS)" << std::endl;*/
+
+    std::cout << "=== Running Naive Convolution ===" << std::endl;
+    double baseline_total_time = 0;
+    long total_flops = 0;
+
+    int device_count = 1;
+    checkCuda(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
+    const bool use_two_gpus = (device_count >= 2);
+
+    for (int l = 0; l < cfg->layer_num; l++) {
+        int H = cfg->H[l], W = cfg->W[l], C = cfg->C[l], K = cfg->K[l], N = cfg->Batch[l];
+        long sizeI = H * W, sizeF = 9, sizeO = (H-2) * (W-2);
+        long P = N * (H-2)/2 * (W-2)/2;
+
+        thrust::host_vector<float>& h_image  = h_images[l];
+        thrust::host_vector<float>& h_filter = h_filters[l];
+
+        // 输出缓冲（host）用于收集两卡结果
+        h_baseline_outputs[l].resize(N * K * sizeO);
+
+        // FLOPs 公式与原代码一致
+        long flops = static_cast<long>(N) * K * C * (H-2) * (W-2) * 18;
+        total_flops += flops;
+
+        if (!use_two_gpus || N < 2) {
+            // ---- 单卡路径（回退）----
+            thrust::device_vector<float> d_image = h_image;
+            thrust::device_vector<float> d_filter = h_filter;
+            thrust::device_vector<float> d_out(N * K * sizeO);
+            thrust::device_vector<float> d_U(16 * K * C);
+            thrust::device_vector<float> d_V(16 * C * P);
+            thrust::device_vector<float> d_M(16 * K * P);
+
+            // Warmup
+            naive_conv(d_image, d_filter, d_out, d_U, d_V, d_M, H, W, C, K, N);
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < LOOP_NUM; i++) {
+                naive_conv(d_image, d_filter, d_out, d_U, d_V, d_M, H, W, C, K, N);
+            }
+            checkCuda(cudaDeviceSynchronize(), "Device sync (single GPU naive)");
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            double secs = std::chrono::duration<double>(t1 - t0).count() / LOOP_NUM;
+            results[l].baseline_time = secs;
+            results[l].baseline_gflops = flops * 1e-9 / secs;
+
+            h_baseline_outputs[l] = d_out;
+        } else {
+            // ---- 双卡路径（按 Batch 维拆分）----
+            int N0 = N / 2;
+            int N1 = N - N0;
+
+            // 两个设备上的分片大小
+            long P0 = N0 * (H-2)/2 * (W-2)/2;
+            long P1 = N1 * (H-2)/2 * (W-2)/2;
+
+            // 为两张卡各建一个流，互不阻塞
+            cudaStream_t s0, s1;
+            { DeviceGuard g(0); checkCuda(cudaStreamCreate(&s0), "create stream 0"); }
+            { DeviceGuard g(1); checkCuda(cudaStreamCreate(&s1), "create stream 1"); }
+
+            // 预创建两卡上的显存（注意：filter 在两卡各自一份；image 只拷各自的 batch 段）
+            // --- 设备0 ---
+            thrust::device_vector<float> d_image0, d_filter0, d_out0, d_U0, d_V0, d_M0;
+            {
+                DeviceGuard g(0);
+                d_image0.resize((long)N0 * C * sizeI);
+                d_filter0 = h_filter; // 拷全量 filter
+                d_out0.resize((long)N0 * K * sizeO);
+                d_U0.resize(16L * K * C);
+                d_V0.resize(16L * C * P0);
+                d_M0.resize(16L * K * P0);
+
+                // 拷贝 image 的 [0, N0) 批次片段
+                checkCuda(cudaMemcpyAsync(
+                    d_image0.data().get(),
+                    h_image.data(),                         // 起点就是 batch 0
+                    sizeof(float) * (long)N0 * C * sizeI,
+                    cudaMemcpyHostToDevice, s0), "H2D image0");
+            }
+
+            // --- 设备1 ---
+            thrust::device_vector<float> d_image1, d_filter1, d_out1, d_U1, d_V1, d_M1;
+            {
+                DeviceGuard g(1);
+                d_image1.resize((long)N1 * C * sizeI);
+                d_filter1 = h_filter; // 同样拷全量 filter
+                d_out1.resize((long)N1 * K * sizeO);
+                d_U1.resize(16L * K * C);
+                d_V1.resize(16L * C * P1);
+                d_M1.resize(16L * K * P1);
+
+                // 拷贝 image 的 [N0, N0+N1) 片段
+                const float* h_img_ptr_1 = h_image.data() + (long)N0 * C * sizeI;
+                checkCuda(cudaMemcpyAsync(
+                    d_image1.data().get(),
+                    h_img_ptr_1,
+                    sizeof(float) * (long)N1 * C * sizeI,
+                    cudaMemcpyHostToDevice, s1), "H2D image1");
+            }
+
+            // warmup（各卡各自一次，放在各自 stream）
+            {
+                DeviceGuard g(0);
+                naive_conv(d_image0, d_filter0, d_out0, d_U0, d_V0, d_M0, H, W, C, K, N0);
+            }
+            {
+                DeviceGuard g(1);
+                naive_conv(d_image1, d_filter1, d_out1, d_U1, d_V1, d_M1, H, W, C, K, N1);
+            }
+            // 同步一次，清空前置工作
+            { DeviceGuard g(0); checkCuda(cudaStreamSynchronize(s0), "warmup sync 0"); }
+            { DeviceGuard g(1); checkCuda(cudaStreamSynchronize(s1), "warmup sync 1"); }
+
+            // 计时（壁钟时间），两卡并行跑 LOOP_NUM 次
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < LOOP_NUM; i++) {
+                { DeviceGuard g(0);
+                naive_conv(d_image0, d_filter0, d_out0, d_U0, d_V0, d_M0, H, W, C, K, N0);
+                }
+                { DeviceGuard g(1);
+                naive_conv(d_image1, d_filter1, d_out1, d_U1, d_V1, d_M1, H, W, C, K, N1);
+                }
+            }
+            // 等两卡都结束
+            { DeviceGuard g(0); checkCuda(cudaDeviceSynchronize(), "sync dev0 naive"); }
+            { DeviceGuard g(1); checkCuda(cudaDeviceSynchronize(), "sync dev1 naive"); }
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            double secs = std::chrono::duration<double>(t1 - t0).count() / LOOP_NUM;
+            results[l].baseline_time   = secs;
+            results[l].baseline_gflops = flops * 1e-9 / secs;
+
+            // 拷回并在 Batch 维拼接
+            {
+                DeviceGuard g(0);
+                checkCuda(cudaMemcpyAsync(
+                    h_baseline_outputs[l].data(),
+                    d_out0.data().get(),
+                    sizeof(float) * (long)N0 * K * sizeO,
+                    cudaMemcpyDeviceToHost, s0), "D2H out0");
+            }
+            {
+                DeviceGuard g(1);
+                checkCuda(cudaMemcpyAsync(
+                    h_baseline_outputs[l].data() + (long)N0 * K * sizeO,
+                    d_out1.data().get(),
+                    sizeof(float) * (long)N1 * K * sizeO,
+                    cudaMemcpyDeviceToHost, s1), "D2H out1");
+            }
+            { DeviceGuard g(0); checkCuda(cudaStreamSynchronize(s0), "copy back 0"); }
+            { DeviceGuard g(1); checkCuda(cudaStreamSynchronize(s1), "copy back 1"); }
+
+            // 销毁流
+            { DeviceGuard g(0); cudaStreamDestroy(s0); }
+            { DeviceGuard g(1); cudaStreamDestroy(s1); }
+        }
+
+        std::cout << "Layer " << std::setw(2) << l << ": " << std::fixed << std::setprecision(2)
+                << results[l].baseline_time * 1000 << " ms ("
+                << results[l].baseline_gflops << " GFLOPS)" << std::endl;
+
+        baseline_total_time += results[l].baseline_time;
+    }
+
+    std::cout << "Baseline Total: " << std::fixed << std::setprecision(2)
+            << baseline_total_time * 1000 << " ms ("
+            << total_flops * 1e-9 / baseline_total_time << " GFLOPS)" << std::endl;
+
+
+
+
+
+
+    /*std::cout << "\n=== Running Winograd Convolution ===" << std::endl;
+    double winograd_total_time = 0;
+    
+    for (int l = 0; l < cfg->layer_num; l++) {
+        int H = cfg->H[l], W = cfg->W[l], C = cfg->C[l], K = cfg->K[l], N = cfg->Batch[l];
+        long sizeI = H * W, sizeF = 9, sizeO = (H-2) * (W-2);
+        long P = N * (H-2)/2 * (W-2)/2;
+        
+        thrust::host_vector<float>& h_image = h_images[l];
+        thrust::host_vector<float>& h_filter = h_filters[l];
+
+        thrust::device_vector<float> d_image = h_image;
+        thrust::device_vector<float> d_filter = h_filter;
+        thrust::device_vector<float> d_out(N * K * sizeO);
+        thrust::device_vector<float> d_U(16 * K * C);
+        thrust::device_vector<float> d_V(16 * C * P);
+        thrust::device_vector<float> d_M(16 * K * P);
+
+        // Warmup
+        winograd_conv(d_image, d_filter, d_out, d_U, d_V, d_M, H, W, C, K, N);
+        
+        cudaEventRecord(start_event);
+        for (int i = 0; i < LOOP_NUM; i++) {
+            winograd_conv(d_image, d_filter, d_out, d_U, d_V, d_M, H, W, C, K, N);
+        }
+        cudaEventRecord(stop_event);
+        cudaEventSynchronize(stop_event);
+        cudaEventElapsedTime(&milliseconds, start_event, stop_event);
+
+        results[l].winograd_time = static_cast<double>(milliseconds / 1000.0f) / LOOP_NUM;
+        
+        h_custom_outputs[l] = d_out;
+        
+        long flops = static_cast<long>(N) * K * C * (H-2) * (W-2) * 18;
+        results[l].winograd_gflops = flops * 1e-9 / results[l].winograd_time;
+        results[l].speedup = results[l].baseline_time / results[l].winograd_time;
+        
+        std::cout << "Layer " << std::setw(2) << l << ": " << std::fixed << std::setprecision(2)
+                  << results[l].winograd_time * 1000 << " ms (" << results[l].winograd_gflops << " GFLOPS)" << std::endl;
+        
+        winograd_total_time += results[l].winograd_time;
+    }
+    
+    std::cout << "Custom Total: " << std::fixed << std::setprecision(2) << winograd_total_time * 1000 
+              << " ms (" << total_flops * 1e-9 / winograd_total_time << " GFLOPS)" << std::endl;*/
+
+
+
+    std::cout << "\n=== Running Winograd Convolution ===" << std::endl;
+    double winograd_total_time = 0;
+
+    for (int l = 0; l < cfg->layer_num; l++) {
+        int H = cfg->H[l], W = cfg->W[l], C = cfg->C[l], K = cfg->K[l], N = cfg->Batch[l];
+        long sizeI = H * W, sizeF = 9, sizeO = (H-2) * (W-2);
+        long P = N * (H-2)/2 * (W-2)/2;
+
+        thrust::host_vector<float>& h_image  = h_images[l];
+        thrust::host_vector<float>& h_filter = h_filters[l];
+
+        h_custom_outputs[l].resize(N * K * sizeO);
+
+        long flops = static_cast<long>(N) * K * C * (H-2) * (W-2) * 18;
+
+        if (!use_two_gpus || N < 2) {
+            // ---- 单卡路径（回退）----
+            thrust::device_vector<float> d_image = h_image;
+            thrust::device_vector<float> d_filter = h_filter;
+            thrust::device_vector<float> d_out(N * K * sizeO);
+            thrust::device_vector<float> d_U(16 * K * C);
+            thrust::device_vector<float> d_V(16 * C * P);
+            thrust::device_vector<float> d_M(16 * K * P);
+
+            // Warmup
+            winograd_conv(d_image, d_filter, d_out, d_U, d_V, d_M, H, W, C, K, N);
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < LOOP_NUM; i++) {
+                winograd_conv(d_image, d_filter, d_out, d_U, d_V, d_M, H, W, C, K, N);
+            }
+            checkCuda(cudaDeviceSynchronize(), "Device sync (single GPU winograd)");
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            double secs = std::chrono::duration<double>(t1 - t0).count() / LOOP_NUM;
+            results[l].winograd_time   = secs;
+            results[l].winograd_gflops = flops * 1e-9 / secs;
+
+            h_custom_outputs[l] = d_out;
+        } else {
+            // ---- 双卡路径（按 Batch 维拆分）----
+            int N0 = N / 2;
+            int N1 = N - N0;
+            long P0 = N0 * (H-2)/2 * (W-2)/2;
+            long P1 = N1 * (H-2)/2 * (W-2)/2;
+
+            cudaStream_t s0, s1;
+            { DeviceGuard g(0); checkCuda(cudaStreamCreate(&s0), "create stream 0"); }
+            { DeviceGuard g(1); checkCuda(cudaStreamCreate(&s1), "create stream 1"); }
+
+            // --- dev0 ---
+            thrust::device_vector<float> d_image0, d_filter0, d_out0, d_U0, d_V0, d_M0;
+            {
+                DeviceGuard g(0);
+                d_image0.resize((long)N0 * C * sizeI);
+                d_filter0 = h_filter;
+                d_out0.resize((long)N0 * K * sizeO);
+                d_U0.resize(16L * K * C);
+                d_V0.resize(16L * C * P0);
+                d_M0.resize(16L * K * P0);
+
+                checkCuda(cudaMemcpyAsync(
+                    d_image0.data().get(),
+                    h_image.data(),
+                    sizeof(float) * (long)N0 * C * sizeI,
+                    cudaMemcpyHostToDevice, s0), "H2D image0");
+            }
+
+            // --- dev1 ---
+            thrust::device_vector<float> d_image1, d_filter1, d_out1, d_U1, d_V1, d_M1;
+            {
+                DeviceGuard g(1);
+                d_image1.resize((long)N1 * C * sizeI);
+                d_filter1 = h_filter;
+                d_out1.resize((long)N1 * K * sizeO);
+                d_U1.resize(16L * K * C);
+                d_V1.resize(16L * C * P1);
+                d_M1.resize(16L * K * P1);
+
+                const float* h_img_ptr_1 = h_image.data() + (long)N0 * C * sizeI;
+                checkCuda(cudaMemcpyAsync(
+                    d_image1.data().get(),
+                    h_img_ptr_1,
+                    sizeof(float) * (long)N1 * C * sizeI,
+                    cudaMemcpyHostToDevice, s1), "H2D image1");
+            }
+
+            // warmup
+            { DeviceGuard g(0); winograd_conv(d_image0, d_filter0, d_out0, d_U0, d_V0, d_M0, H, W, C, K, N0); }
+            { DeviceGuard g(1); winograd_conv(d_image1, d_filter1, d_out1, d_U1, d_V1, d_M1, H, W, C, K, N1); }
+            { DeviceGuard g(0); checkCuda(cudaStreamSynchronize(s0), "warmup sync 0"); }
+            { DeviceGuard g(1); checkCuda(cudaStreamSynchronize(s1), "warmup sync 1"); }
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < LOOP_NUM; i++) {
+                { DeviceGuard g(0); winograd_conv(d_image0, d_filter0, d_out0, d_U0, d_V0, d_M0, H, W, C, K, N0); }
+                { DeviceGuard g(1); winograd_conv(d_image1, d_filter1, d_out1, d_U1, d_V1, d_M1, H, W, C, K, N1); }
+            }
+            { DeviceGuard g(0); checkCuda(cudaDeviceSynchronize(), "sync dev0 winograd"); }
+            { DeviceGuard g(1); checkCuda(cudaDeviceSynchronize(), "sync dev1 winograd"); }
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            double secs = std::chrono::duration<double>(t1 - t0).count() / LOOP_NUM;
+            results[l].winograd_time   = secs;
+            results[l].winograd_gflops = flops * 1e-9 / secs;
+
+            // 回拷与拼接
+            {
+                DeviceGuard g(0);
+                checkCuda(cudaMemcpyAsync(
+                    h_custom_outputs[l].data(),
+                    d_out0.data().get(),
+                    sizeof(float) * (long)N0 * K * sizeO,
+                    cudaMemcpyDeviceToHost, s0), "D2H out0");
+            }
+            {
+                DeviceGuard g(1);
+                checkCuda(cudaMemcpyAsync(
+                    h_custom_outputs[l].data() + (long)N0 * K * sizeO,
+                    d_out1.data().get(),
+                    sizeof(float) * (long)N1 * K * sizeO,
+                    cudaMemcpyDeviceToHost, s1), "D2H out1");
+            }
+            { DeviceGuard g(0); checkCuda(cudaStreamSynchronize(s0), "copy back 0"); }
+            { DeviceGuard g(1); checkCuda(cudaStreamSynchronize(s1), "copy back 1"); }
+
+            { DeviceGuard g(0); cudaStreamDestroy(s0); }
+            { DeviceGuard g(1); cudaStreamDestroy(s1); }
+        }
+
+        results[l].speedup = results[l].baseline_time / results[l].winograd_time;
+
+        std::cout << "Layer " << std::setw(2) << l << ": " << std::fixed << std::setprecision(2)
+                << results[l].winograd_time * 1000 << " ms ("
+                << results[l].winograd_gflops << " GFLOPS)" << std::endl;
+
+        winograd_total_time += results[l].winograd_time;
+    }
+
+    std::cout << "Custom Total: " << std::fixed << std::setprecision(2)
+            << winograd_total_time * 1000 << " ms ("
+            << total_flops * 1e-9 / winograd_total_time << " GFLOPS)" << std::endl;
+
+    
+    std::cout << "\n=== Correctness Check ===" << std::endl;
+    bool all_correct = true;
+    for (int l = 0; l < cfg->layer_num; l++) {
+        int H = cfg->H[l], W = cfg->W[l], C = cfg->C[l], K = cfg->K[l], N = cfg->Batch[l];
+        long sizeO = (H-2) * (W-2);
+        
+        results[l].passed = true;
+        for (long i = 0; i < N * K * sizeO; i++) {
+            if (std::abs((h_custom_outputs[l][i] - h_baseline_outputs[l][i]) / (h_baseline_outputs[l][i] + 1e-8f)) > 1e-4f) {
+                results[l].passed = false;
+                all_correct = false;
+                break;
+            }
+        }
+        
+        std::cout << "Layer " << std::setw(2) << l << ": " 
+                  << (results[l].passed ? GREEN "CORRECT" RESET : RED "INCORRECT" RESET)
+                  << " (Speedup: " << std::fixed << std::setprecision(2) << results[l].speedup << "x)" << std::endl;
+    }
+    
+    double overall_speedup = baseline_total_time / winograd_total_time;
+    std::cout << "\n=== Final Results ===" << std::endl;
+    if (all_correct) {
+        std::cout << GREEN "Results are correct!" RESET << std::endl;
+    } else {
+        std::cout << RED "Results are different!" RESET << std::endl;
+    }
+
+    std::cout << "Naive:    " << std::fixed << std::setprecision(2) << baseline_total_time * 1000 
+              << " ms (" << total_flops * 1e-9 / baseline_total_time << " GFLOPS)" << std::endl;
+    std::cout << "Winograd: " << std::fixed << std::setprecision(2) << winograd_total_time * 1000 
+              << " ms (" << total_flops * 1e-9 / winograd_total_time << " GFLOPS)" << std::endl;
+    std::cout << "Overall speedup: " << std::fixed << std::setprecision(2) << overall_speedup << "x" << std::endl;
+    
+    cudaEventDestroy(start_event);
+    cudaEventDestroy(stop_event);
+    
+    return all_correct ? 0 : -1;
+}
+
